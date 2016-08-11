@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import subprocess
+import time
+import yaml
+
+LOG_LEVEL = logging.DEBUG if os.getenv('DEBUG', None) else logging.INFO
+
+parser = argparse.ArgumentParser(description='Run a point in time restore for Postgres.')
+parser.add_argument('--source', metavar='-S', type=str, help='source directory of the Postgres.')
+parser.add_argument('--wal', metavar='-W', type=str, help='wal archive directory.')
+parser.add_argument('--destination', metavar='-D', type=str, help='destination directory.')
+parser.add_argument('--time', metavar='-T', type=str, help='the time to be restored (YYYY-mm-dd HH:MM:SS):')
+parser.add_argument('--auto-start', metavar='-A', action='store_const', const=True, help='start Postgres after a successful recovery process.')
+parser.set_defaults(source=None, wal=None, destination=None, time=None, auto_start=False)
+command_line_args = parser.parse_args()
+
+config = yaml.load(open('config.yml', 'r').read())
+
+# Find the source directory and extract the Postgres version
+source_data_directory = command_line_args.source or raw_input('Source data directory: ')
+try:
+    database_version = open('%s/PG_VERSION' % source_data_directory, 'r').read().strip()
+except IOError:
+    logging.fatal('Error opening data directory %s' % source_data_directory)
+    sys.exit(1)
+
+# Ensure we have the proper version of Postgres
+bin_path = config['versions'][database_version]
+
+# Source the WAL archive
+wal_archive = command_line_args.wal or raw_input('Source wal archive: ')
+
+# Format the destination time properly
+dest_time = command_line_args.time or raw_input('Restore time UTC (YYYY-mm-dd HH:MM:SS): ')
+dest_time = time.strptime(dest_time, '%Y-%m-%d %H:%M:%S')
+
+# Build the destination directory
+dest_data_directory = command_line_args.destination or raw_input('Destination data directory: ')
+os.makedirs(dest_data_directory)
+os.system("chmod 700 %s" % dest_data_directory)
+
+# Copy the source directory
+if subprocess.call('cp -a %(source)s/* %(dest)s/' % {'source': source_data_directory, 'dest': dest_data_directory}, shell=True) != 0:
+    logging.fatal('Error copying source to destination to begin the restore process.')
+    sys.exit(1)
+
+# Modify postgresql.conf to not overwrite the source wal files
+template = """
+max_connections = 100
+shared_buffers = 128MB
+dynamic_shared_memory_type = posix
+wal_level = hot_standby
+# archive_mode = on
+# archive_command = 'mv %p ../wal_archive/$f'
+# max_wal_senders = 1
+log_timezone = 'US/Central'
+datestyle = 'iso, mdy'
+timezone = 'US/Central'
+lc_messages = 'en_US.UTF-8'
+lc_monetary = 'en_US.UTF-8'
+lc_numeric = 'en_US.UTF-8'
+lc_time = 'en_US.UTF-8'
+default_text_search_config = 'pg_catalog.english'
+"""
+postgresql_conf = open("%s/postgresql.conf" % dest_data_directory, "w")
+postgresql_conf.write(template)
+postgresql_conf.close()
+
+
+# Build the recovery.conf file
+template = """
+recovery_target_action=shutdown
+"""
+recovery_conf = open("%s/recovery.conf" % dest_data_directory, "w")
+recovery_conf.write(template.format(target_time=time.strftime('%Y-%m-%dT%H:%M:%SZ', dest_time), wal_archive=wal_archive))
+recovery_conf.close()
+
+# start postgresql
+if subprocess.call("exit 1", shell=True) != 0:
+    logging.fatal("Error running Postgres")
+    sys.exit(1)
+
+# remove recovery.conf to restart Postgres
+
+# start Postgres if selected
+if command_line_args.auto_start:
+    try:
+        process = subprocess.Popen("exit 1", shell=True)
+        process.wait()
+    except:
+        process.send_signal(signal.SIGTERM)
+        while process.poll() == None:
+            logging.info("Waiting on Postgres to cleanly shutdown.")
+            time.sleep(1)
+
+# else exit cleanly
+sys.exit(0)
